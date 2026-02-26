@@ -96,3 +96,8 @@ coverage.xml
 .env
 
 **/.claude/settings.local.json
+
+# Gateway sensitive files
+gateway-files/conf/wallets/
+gateway-files/logs/
+.venv310/

@@ -1,0 +1,3 @@
+defaultNetwork: base
+defaultWallet: '0x834B1efB29ba2301B44549a249D921fE9dA14795'
+rpcProvider: url

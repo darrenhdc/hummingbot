@@ -112,7 +112,11 @@ class CreateCommand:
     async def prompt_for_configuration_v2(self,  # type: HummingbotApplication
                                           script_to_config: str):
         try:
-            module = sys.modules.get(f"{settings.SCRIPT_STRATEGIES_MODULE}.{script_to_config}")
+            module_name = f"{settings.SCRIPT_STRATEGIES_MODULE}.{script_to_config}"
+            module = sys.modules.get(module_name)
+            if module is None:
+                # Module not loaded yet, import it first
+                module = importlib.import_module(module_name)
             script_module = importlib.reload(module)
             config_class = next((member for member_name, member in inspect.getmembers(script_module)
                                  if

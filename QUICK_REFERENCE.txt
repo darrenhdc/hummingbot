@@ -1,0 +1,218 @@
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃       🚀 ETH/USDC LP TRADING - QUICK REFERENCE CARD          ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+
+═══════════════════════════════════════════════════════════════
+  FIRST TIME SETUP (Do Once)
+═══════════════════════════════════════════════════════════════
+
+1️⃣  Run Pre-flight Check:
+   ./preflight_check.sh
+
+2️⃣  Start Hummingbot:
+   ./start
+
+3️⃣  Connect Ethereum Wallet:
+   gateway connect ethereum
+   → Enter network: mainnet (or goerli for testnet)
+   → Enter private key: 0x...
+
+4️⃣  Verify Connection:
+   gateway connector-tokens uniswap ethereum
+   → Should show your ETH and USDC balances
+
+═══════════════════════════════════════════════════════════════
+  DAILY TRADING WORKFLOW
+═══════════════════════════════════════════════════════════════
+
+▶️  START TRADING:
+   start --script quick_eth_usdc_lp.py
+
+⏸️  STOP TRADING:
+   stop
+
+📊 CHECK STATUS:
+   status
+   
+📈 VIEW HISTORY:
+   history
+
+💰 CHECK BALANCE:
+   balance
+
+═══════════════════════════════════════════════════════════════
+  CONFIGURATION (Edit Before Starting)
+═══════════════════════════════════════════════════════════════
+
+📝 Config File Location:
+   conf/scripts/conf_quick_eth_usdc_lp_0.yml
+
+⚙️  Key Settings to Adjust:
+   • entry_amount_eth: How much ETH to provide (default: 0.1)
+   • entry_amount_usdc: How much USDC to provide (default: 300)
+   • range_lower_pct: % below price (default: 5%)
+   • range_upper_pct: % above price (default: 5%)
+   • stop_loss_pct: Exit if down this % (default: 10%)
+   • network: ethereum, arbitrum, optimism, or polygon
+
+═══════════════════════════════════════════════════════════════
+  MONITORING COMMANDS
+═══════════════════════════════════════════════════════════════
+
+🔍 Check Live Positions:
+   gateway connector-positions uniswap ethereum WETH-USDC
+
+💵 Get Current ETH Price:
+   gateway get-price uniswap ethereum WETH-USDC 1
+
+📜 View Logs (Real-time):
+   # In new terminal window:
+   tail -f logs/logs_script.log
+
+🔧 Check Gateway Status:
+   gateway status
+
+═══════════════════════════════════════════════════════════════
+  EMERGENCY COMMANDS
+═══════════════════════════════════════════════════════════════
+
+🛑 STOP IMMEDIATELY:
+   stop
+   
+🚨 KILL ALL:
+   Ctrl + C (in terminal)
+   
+📤 MANUALLY CLOSE POSITION:
+   1. Stop the bot: stop
+   2. Go to Uniswap UI: https://app.uniswap.org
+   3. Connect wallet and close position manually
+
+═══════════════════════════════════════════════════════════════
+  NETWORK OPTIONS & GAS FEES
+═══════════════════════════════════════════════════════════════
+
+🌐 ETHEREUM MAINNET (High security, High fees)
+   Gas: ~$50-200 per tx
+   network: ethereum
+   
+⚡ ARBITRUM (L2, Lower fees)
+   Gas: ~$1-5 per tx
+   network: arbitrum
+   
+🔴 OPTIMISM (L2, Lower fees)
+   Gas: ~$1-5 per tx
+   network: optimism
+   
+🟣 POLYGON (Sidechain, Very low fees)
+   Gas: <$1 per tx
+   network: polygon
+
+═══════════════════════════════════════════════════════════════
+  STRATEGY PARAMETERS GUIDE
+═══════════════════════════════════════════════════════════════
+
+📊 TIGHT RANGE (More fees, More risk):
+   range_lower_pct: 2
+   range_upper_pct: 2
+   → Best for: Stable/ranging markets
+   → Risk: High (out of range quickly)
+
+📊 MEDIUM RANGE (Balanced):
+   range_lower_pct: 5
+   range_upper_pct: 5
+   → Best for: Normal volatility
+   → Risk: Medium
+
+📊 WIDE RANGE (Less fees, Less risk):
+   range_lower_pct: 10
+   range_upper_pct: 10
+   → Best for: High volatility / set and forget
+   → Risk: Low
+
+═══════════════════════════════════════════════════════════════
+  EXAMPLE SCENARIOS
+═══════════════════════════════════════════════════════════════
+
+💼 CONSERVATIVE (Low risk, low return):
+   entry_amount_eth: 0.05
+   entry_amount_usdc: 150
+   range_lower_pct: 10
+   range_upper_pct: 10
+   stop_loss_pct: 15
+   network: arbitrum  # Lower gas fees
+
+💼 BALANCED (Medium risk, medium return):
+   entry_amount_eth: 0.1
+   entry_amount_usdc: 300
+   range_lower_pct: 5
+   range_upper_pct: 5
+   stop_loss_pct: 10
+   network: ethereum
+
+💼 AGGRESSIVE (Higher risk, higher return):
+   entry_amount_eth: 0.2
+   entry_amount_usdc: 600
+   range_lower_pct: 2
+   range_upper_pct: 2
+   stop_loss_pct: 8
+   network: ethereum
+
+═══════════════════════════════════════════════════════════════
+  TROUBLESHOOTING
+═══════════════════════════════════════════════════════════════
+
+❌ "Gateway not connected"
+   → gateway status
+   → gateway start (if needed)
+   
+❌ "Insufficient balance"
+   → Check: balance
+   → Ensure you have extra ETH for gas
+   
+❌ "Network error"
+   → Check internet connection
+   → Verify Gateway is running: docker ps
+   
+❌ "Transaction failed"
+   → Check gas price (might be too low)
+   → Check wallet has enough ETH for gas
+   → Try again after a minute
+
+═══════════════════════════════════════════════════════════════
+  IMPORTANT REMINDERS
+═══════════════════════════════════════════════════════════════
+
+⚠️  ALWAYS HAVE: Extra 0.01-0.05 ETH for gas
+⚠️  START SMALL: Test with small amounts first
+⚠️  UNDERSTAND IL: Impermanent loss is real
+⚠️  MONITOR OFTEN: Check position at least daily
+⚠️  SECURE KEYS: Never share your private key
+⚠️  TEST FIRST: Use testnet before mainnet
+
+═══════════════════════════════════════════════════════════════
+  USEFUL LINKS
+═══════════════════════════════════════════════════════════════
+
+📖 Full Guide: QUICK_START_ETH_USDC_LP.md
+🌐 Hummingbot Docs: https://hummingbot.org
+💬 Discord: https://discord.gg/hummingbot
+📊 Uniswap: https://app.uniswap.org
+📈 ETH Gas: https://etherscan.io/gastracker
+
+═══════════════════════════════════════════════════════════════
+  QUICK START (Copy & Paste)
+═══════════════════════════════════════════════════════════════
+
+./preflight_check.sh                    # Check everything
+./start                                 # Start bot
+gateway connect ethereum                # Connect wallet
+start --script quick_eth_usdc_lp.py    # Start trading!
+
+═══════════════════════════════════════════════════════════════
+
+💡 Pro Tip: Keep this file open in a second terminal while trading!
+
+Print this file: cat QUICK_REFERENCE.txt
+
+═══════════════════════════════════════════════════════════════
+🚀 Ready? Let's make those LP gains! 🚀
