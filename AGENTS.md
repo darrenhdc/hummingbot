@@ -141,17 +141,33 @@ Before ANY strategy execution, ensure:
 
 ### Gateway Connection Issues
 ```bash
-# Diagnostic sequence
-1. gateway status                          # Check if running
-2. docker ps | grep gateway                # Verify container
-3. gateway connector-tokens uniswap ethereum  # Test connection
-4. tail -f logs/logs_script.log           # Check error logs
+# Diagnostic sequence (2026-03-02 verified correct commands)
+1. docker ps | grep gateway                          # Verify container running
+2. docker-compose --profile gateway up -d gateway    # Start if not running
+   # Note: if SSH keychain error, first run:
+   # security -v unlock-keychain ~/Library/Keychains/login.keychain-db
+3. sleep 15 && docker logs gateway --tail 10         # Confirm "listening on 15888"
+
+# In Hummingbot >>> prompt:
+gateway ping                        # Test connectivity → "Gateway online"
+gateway connect ethereum            # Connect Base/Ethereum wallet
+                                    # → select network: base, enter private key
+gateway balance ethereum WETH,USDC  # Check Base chain balances
+                                    # (NOT: gateway connector-tokens / NOT: gateway balance uniswap base)
 
 # Common fixes
-- gateway restart
-- docker-compose restart gateway
-- gateway connect ethereum (reconnect wallet)
+- docker restart gateway
+- security -v unlock-keychain ~/Library/Keychains/login.keychain-db  # SSH keychain unlock
 ```
+
+### Gateway 命令速查（2026-03-02 验证版）
+
+| 目的 | 正确命令 | 错误用法（不要用） |
+|------|---------|-----------------|
+| 测试连通 | `gateway ping` | `gateway status` |
+| 连接钱包 | `gateway connect ethereum` | `gateway connect uniswap base` |
+| 查余额 | `gateway balance ethereum WETH,USDC` | `gateway balance uniswap base` / `gateway connector-tokens` |
+| 查钱包列表 | `gateway list` | — |
 
 ### Transaction Failures
 ```python
@@ -224,10 +240,11 @@ Your Response:
 ```
 
 ### Use Chinese for Responses
-- Primary language: 中文（用户更容易理解）
-- Technical terms: Use English when necessary (Gateway, LP, IL)
-- Code/commands: Always in English
-- Explanations: 中文 with English terms in parentheses when needed
+**强制规则：所有回复必须使用简体中文。无论用户用何种语言提问，均须以简体中文作答。**
+- 主要语言：简体中文（强制，无例外）
+- 技术术语：必要时使用英文原文，如 Gateway、LP、IL，但说明部分仍须为中文
+- 代码 / 命令：保持英文
+- 解释说明：简体中文，专业词汇可在括号内附英文原文
 
 ---
 
@@ -321,6 +338,59 @@ if self.entry_price and (current_price - self.entry_price) / self.entry_price < 
 2. **Close via UI**: Show how to close position manually
 3. **Save logs**: Tell user to save `logs/logs_script.log`
 4. **Report issue**: Guide to Hummingbot Discord
+
+---
+
+## 本机环境 SOP（darrencui-macmini）
+
+### Python 环境说明
+- **conda 未加入 PATH**，在终端直接输入 `conda` 会报 `command not found`
+- **正确的 Python 环境**：`/Users/darrencui/hummingbot/.venv310`（Python 3.10.19，已含 hummingbot 全部依赖）
+- 验证命令：`/Users/darrencui/hummingbot/.venv310/bin/python -c "import hummingbot; print('OK')"`
+
+### 启动 Hummingbot
+```bash
+cd /Users/darrencui/hummingbot
+./start
+```
+`start` 脚本已配置为直接使用 `.venv310`，无需激活 conda。
+
+### 关键路径
+| 项目 | 路径 |
+|---|---|
+| 项目根目录 | `/Users/darrencui/hummingbot` |
+| Python 环境 | `/Users/darrencui/hummingbot/.venv310` |
+| 日志 | `/Users/darrencui/hummingbot/logs` |
+| 策略脚本 | `/Users/darrencui/hummingbot/scripts/fgi_llm_hyperliquid_spot.py` |
+| 环境变量 | `/Users/darrencui/hummingbot/.env` |
+| Hyperliquid 连接器配置 | `/Users/darrencui/hummingbot/conf/connectors/hyperliquid.yml` |
+
+### 常见错误排查
+
+**错误：`Failed to activate 'hummingbot' conda environment`**
+- 原因：`start` 脚本曾引用 conda，现已修复为 `.venv310`
+- 解决：确认 `start` 脚本顶部使用 `VENV_PYTHON=.../.venv310/bin/python`，不再有 `conda activate` 调用
+
+**错误：路径中含 `handongcui`**
+- 原因：配置从旧机器迁移，路径未更新
+- 需检查的文件：`start`、`conf/conf_client.yml`、`quick_install_conda.sh`
+- 正确路径前缀：`/Users/darrencui/hummingbot`
+
+**错误：`.env` 缺少 `STRAT_*` 参数**
+- 策略会 fallback 到默认值（$20 总资金），需确认 `.env` 中包含完整的 `STRAT_*` 配置
+
+**错误：`Failed to start strategy: 'uniswap/clmm/base'`（2026-03-02 发现）**
+- 原因：Hummingbot 只支持 2 段式 connector 名称（`name/type`），不支持 3 段（`name/type/network`）
+- 解决：将策略中的 `f"uniswap/clmm/{config.network}"` 改为 `"uniswap/clmm"`
+- 网络选择：在 `gateway-files/conf/connectors/uniswap.yml` 中设置 `defaultNetwork: base`
+
+**错误：`docker: command not found`（SSH 会话）**
+- 原因：SSH 登录时 keychain 未解锁，Docker Desktop 无法启动守护进程
+- 解决：先运行 `security -v unlock-keychain ~/Library/Keychains/login.keychain-db`
+
+**错误：Gateway `could not determine default network for uniswap`**
+- 原因：`gateway-files/conf/connectors/uniswap.yml` 缺少 `defaultNetwork` 字段
+- 解决：在 yml 文件顶部添加 `defaultNetwork: base`
 
 ---
 

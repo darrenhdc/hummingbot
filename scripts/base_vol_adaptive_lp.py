@@ -3,12 +3,15 @@ Base Mainnet ETH/USDC 波动率自适应 LP 策略
 改编自 strategy_000_vol_adaptive
 """
 
+import json
 import logging
+import math
 import os
+import time
 from decimal import Decimal
 from typing import Dict, Optional
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.connector.connector_base import ConnectorBase
@@ -69,6 +72,37 @@ class BaseVolAdaptiveLPConfig(BaseClientModel):
         200,
         json_schema_extra={"prompt": "备用区间宽度 bps (200 = 2%)", "prompt_on_new": False}
     )
+
+    # 风险参数（统一配置校验）
+    max_position_pct: Decimal = Field(
+        Decimal("50"),
+        json_schema_extra={"prompt": "仓位上限占总资产百分比（<=50）", "prompt_on_new": True}
+    )
+
+    gas_token: str = Field(
+        "ETH",
+        json_schema_extra={"prompt": "Gas token symbol", "prompt_on_new": True}
+    )
+
+    min_gas_reserve: Decimal = Field(
+        Decimal("0.02"),
+        json_schema_extra={"prompt": "最小 gas 预留", "prompt_on_new": True}
+    )
+
+    stop_loss_pct: Decimal = Field(
+        Decimal("10"),
+        json_schema_extra={"prompt": "止损百分比（正数）", "prompt_on_new": True}
+    )
+
+    strategy_id: str = Field(
+        "base_vol_adaptive_lp",
+        json_schema_extra={"prompt": "Strategy ID for analytics adapter", "prompt_on_new": False}
+    )
+
+    analytics_output_path: str = Field(
+        "logs/base_vol_adaptive_lp_events.jsonl",
+        json_schema_extra={"prompt": "Analytics adapter output jsonl path", "prompt_on_new": False}
+    )
     
     # 监控间隔
     check_interval: int = Field(
@@ -81,6 +115,27 @@ class BaseVolAdaptiveLPConfig(BaseClientModel):
         True,
         json_schema_extra={"prompt": "启动时自动开仓?", "prompt_on_new": True}
     )
+
+    @field_validator("max_position_pct")
+    @classmethod
+    def validate_max_position_pct(cls, v: Decimal):
+        if v <= 0 or v > 50:
+            raise ValueError("max_position_pct must be in (0, 50]")
+        return v
+
+    @field_validator("min_gas_reserve")
+    @classmethod
+    def validate_min_gas_reserve(cls, v: Decimal):
+        if v <= 0:
+            raise ValueError("min_gas_reserve must be > 0")
+        return v
+
+    @field_validator("stop_loss_pct")
+    @classmethod
+    def validate_stop_loss_pct(cls, v: Decimal):
+        if v <= 0 or v >= 100:
+            raise ValueError("stop_loss_pct must be in (0, 100)")
+        return v
 
 
 class BaseVolAdaptiveLP(ScriptStrategyBase):
@@ -96,14 +151,14 @@ class BaseVolAdaptiveLP(ScriptStrategyBase):
     
     @classmethod
     def init_markets(cls, config: BaseVolAdaptiveLPConfig):
-        # Base mainnet 使用 uniswap/clmm
-        connector_name = f"uniswap/clmm/{config.network}"
+        # 连接器名称为 2 段格式，网络由 Gateway defaultNetwork 自动决定
+        connector_name = "uniswap/clmm"
         cls.markets = {connector_name: {config.trading_pair}}
     
     def __init__(self, connectors: Dict[str, ConnectorBase], config: BaseVolAdaptiveLPConfig):
         super().__init__(connectors)
         self.config = config
-        self.exchange = f"uniswap/clmm/{config.network}"
+        self.exchange = "uniswap/clmm"
         self.base_token, self.quote_token = config.trading_pair.split("-")
         
         # 策略参数
@@ -124,6 +179,7 @@ class BaseVolAdaptiveLP(ScriptStrategyBase):
         # 追踪
         self.entry_price: Optional[Decimal] = None
         self.rebalance_count = 0
+        self.last_adapter_event: Optional[Dict] = None
         
         self.log_with_clock(logging.INFO, "🚀 Base Mainnet 波动率自适应 LP 策略已启动")
         self.log_with_clock(logging.INFO, f"💰 测试金额: {config.entry_amount_eth} ETH + {config.entry_amount_usdc} USDC")
@@ -182,15 +238,12 @@ class BaseVolAdaptiveLP(ScriptStrategyBase):
     def _calculate_range_width(self) -> int:
         """计算动态区间宽度（基于波动率）"""
         try:
-            # TODO: 接入真实波动率数据源
-            # 现在使用简化版本：根据最近价格变动估算
             sigma_ratio = None
-            
-            # 这里可以接入您的波动率指标
-            # from market_indicators import get_realized_vol_7d
-            # sigma_percent = get_realized_vol_7d()
-            # if sigma_percent:
-            #     sigma_ratio = float(sigma_percent) / 100.0
+            from scripts.market_indicators import get_realized_vol_7d
+
+            sigma_percent = get_realized_vol_7d()
+            if sigma_percent is not None:
+                sigma_ratio = float(sigma_percent) / 100.0
             
             if sigma_ratio is not None:
                 # 波动率公式：区间 = w_min + k × (σ - σ0)
@@ -204,7 +257,7 @@ class BaseVolAdaptiveLP(ScriptStrategyBase):
                                   f"📊 使用备用区间宽度: {self.fallback_width_bps/100:.2f}%")
                 return self.fallback_width_bps
         except Exception as e:
-            self.log_with_clock(logging.WARNING, f"⚠️  计算区间宽度失败: {e}")
+            self.log_with_clock(logging.WARNING, f"⚠️  波动率源异常，使用 fallback: {e}")
             return self.fallback_width_bps
     
     async def _open_position(self):
@@ -215,6 +268,26 @@ class BaseVolAdaptiveLP(ScriptStrategyBase):
         try:
             self.position_opening = True
             current_price = Decimal(str(self.pool_info.price))
+
+            if not self._has_sufficient_gas_reserve():
+                self.log_with_clock(logging.WARNING, "⛔ gas reserve 不足，拒绝开仓")
+                self._emit_adapter_event(
+                    action="hold",
+                    reason="gas_reserve_insufficient",
+                    price=current_price,
+                    gas_cost=None,
+                )
+                return
+
+            if not self._within_max_position_exposure(current_price):
+                self.log_with_clock(logging.WARNING, "⛔ 超过 max_position_pct 总暴露上限，拒绝开仓")
+                self._emit_adapter_event(
+                    action="hold",
+                    reason="max_position_pct_exceeded",
+                    price=current_price,
+                    gas_cost=None,
+                )
+                return
             
             # 计算动态区间
             width_bps = self._calculate_range_width()
@@ -246,13 +319,22 @@ class BaseVolAdaptiveLP(ScriptStrategyBase):
             
             self.log_with_clock(logging.INFO, f"✅ 开仓成功! Order ID: {order_id}")
             self.log_with_clock(logging.INFO, f"💰 开仓价格: ${current_price:,.2f}")
+            self._emit_adapter_event(
+                action="open",
+                reason="entry_opened",
+                price=current_price,
+                range_lower=lower_price,
+                range_upper=upper_price,
+                in_range=True,
+                gas_cost=None,
+            )
             
         except Exception as e:
             self.log_with_clock(logging.ERROR, f"❌ 开仓失败: {e}")
         finally:
             self.position_opening = False
     
-    async def _rebalance_position(self):
+    async def _rebalance_position(self, current_price: Decimal):
         """重新平衡仓位"""
         if self.position_rebalancing or not self.position_info:
             return
@@ -262,14 +344,33 @@ class BaseVolAdaptiveLP(ScriptStrategyBase):
             self.rebalance_count += 1
             
             self.log_with_clock(logging.INFO, f"🔄 开始重新平衡 (第 {self.rebalance_count} 次)...")
+
+            self._emit_adapter_event(
+                action="rebalance",
+                reason="out_of_range",
+                price=current_price,
+                range_lower=Decimal(str(self.position_info.lower_price)),
+                range_upper=Decimal(str(self.position_info.upper_price)),
+                in_range=False,
+                gas_cost=None,
+            )
             
             # 1. 关闭当前仓位
-            await self.connectors[self.exchange].close_position(
+            order_id = await self.connectors[self.exchange].close_position(
                 trading_pair=self.config.trading_pair,
                 position_address=self.position_info.address,
             )
             
-            self.log_with_clock(logging.INFO, "✅ 旧仓位已关闭")
+            self.log_with_clock(logging.INFO, f"✅ 旧仓位已关闭: {order_id}")
+            self._emit_adapter_event(
+                action="close",
+                reason="rebalance_close",
+                price=current_price,
+                range_lower=Decimal(str(self.position_info.lower_price)),
+                range_upper=Decimal(str(self.position_info.upper_price)),
+                in_range=False,
+                gas_cost=None,
+            )
             
             # 2. 等待确认
             import asyncio
@@ -313,6 +414,18 @@ class BaseVolAdaptiveLP(ScriptStrategyBase):
             )
             
             current_price = Decimal(str(self.pool_info.price))
+
+            # 强制止损路径
+            if self.entry_price and self.entry_price > 0:
+                drawdown_pct = (self.entry_price - current_price) / self.entry_price * Decimal(100)
+                if drawdown_pct >= self.config.stop_loss_pct:
+                    self.log_with_clock(
+                        logging.WARNING,
+                        f"🛑 Stop-loss 触发: drawdown={drawdown_pct:.2f}% >= {self.config.stop_loss_pct}%",
+                    )
+                    await self._close_position(reason="stop_loss", current_price=current_price)
+                    return
+
             lower_price = Decimal(str(self.position_info.lower_price))
             upper_price = Decimal(str(self.position_info.upper_price))
             
@@ -331,10 +444,120 @@ class BaseVolAdaptiveLP(ScriptStrategyBase):
                                   f"   原区间: ${lower_price:,.2f} - ${upper_price:,.2f}")
                 
                 # 执行重新平衡
-                await self._rebalance_position()
+                await self._rebalance_position(current_price=current_price)
             
         except Exception as e:
             self.log_with_clock(logging.ERROR, f"❌ 监控仓位失败: {e}")
+
+    async def _close_position(self, reason: str, current_price: Decimal):
+        """执行平仓并输出最小 analytics adapter 事件"""
+        if not self.position_info or self.position_closing:
+            return
+
+        try:
+            self.position_closing = True
+            order_id = await self.connectors[self.exchange].close_position(
+                trading_pair=self.config.trading_pair,
+                position_address=self.position_info.address,
+            )
+            self.log_with_clock(logging.INFO, f"✅ 平仓成功: {order_id}, reason={reason}")
+
+            self._emit_adapter_event(
+                action="close",
+                reason=reason,
+                price=current_price,
+                range_lower=Decimal(str(self.position_info.lower_price)),
+                range_upper=Decimal(str(self.position_info.upper_price)),
+                in_range=bool(self.position_info.in_range),
+                gas_cost=None,
+            )
+
+            self.position_opened = False
+            self.position_info = None
+        except Exception as e:
+            self.log_with_clock(logging.ERROR, f"❌ 平仓失败: {e}")
+        finally:
+            self.position_closing = False
+
+    def _has_sufficient_gas_reserve(self) -> bool:
+        gas_balance = Decimal(str(self.connectors[self.exchange].get_balance(self.config.gas_token)))
+        return gas_balance >= self.config.min_gas_reserve
+
+    def _within_max_position_exposure(self, current_price: Decimal) -> bool:
+        """总暴露口径：拟开仓价值 <= (钱包总价值 * max_position_pct)。"""
+        base_balance = Decimal(str(self.connectors[self.exchange].get_balance(self.base_token)))
+        quote_balance = Decimal(str(self.connectors[self.exchange].get_balance(self.quote_token)))
+        wallet_total_quote = quote_balance + base_balance * current_price
+        max_allowed_quote = wallet_total_quote * (self.config.max_position_pct / Decimal(100))
+        intended_exposure_quote = self.config.entry_amount_usdc + self.config.entry_amount_eth * current_price
+        return intended_exposure_quote <= max_allowed_quote
+
+    def _estimate_fees_collected(self, current_price: Decimal) -> Optional[Decimal]:
+        if not self.position_info:
+            return None
+        base_fee = Decimal(str(getattr(self.position_info, "base_fee_amount", 0)))
+        quote_fee = Decimal(str(getattr(self.position_info, "quote_fee_amount", 0)))
+        return base_fee * current_price + quote_fee
+
+    def _estimate_il_pct(self, current_price: Decimal) -> Optional[Decimal]:
+        if not self.entry_price or self.entry_price <= 0:
+            return None
+        ratio = float(current_price / self.entry_price)
+        if ratio <= 0:
+            return None
+        il = (2 * math.sqrt(ratio) / (1 + ratio) - 1) * 100
+        return Decimal(str(il))
+
+    def _build_adapter_event(
+        self,
+        *,
+        action: str,
+        reason: str,
+        price: Decimal,
+        range_lower: Optional[Decimal] = None,
+        range_upper: Optional[Decimal] = None,
+        in_range: Optional[bool] = None,
+        gas_cost: Optional[Decimal] = None,
+    ) -> Dict:
+        fees_collected = self._estimate_fees_collected(price)
+        estimated_il_pct = self._estimate_il_pct(price)
+        return {
+            "strategy_id": self.config.strategy_id,
+            "timestamp": int(time.time()),
+            "action": action,
+            "reason": reason,
+            "price": float(price),
+            "range_lower": float(range_lower) if range_lower is not None else None,
+            "range_upper": float(range_upper) if range_upper is not None else None,
+            "in_range": in_range,
+            "fees_collected": float(fees_collected) if fees_collected is not None else None,
+            "estimated_il_pct": float(estimated_il_pct) if estimated_il_pct is not None else None,
+            "gas_cost": float(gas_cost) if gas_cost is not None else None,
+        }
+
+    def _emit_adapter_event(self, **kwargs):
+        event = self._build_adapter_event(**kwargs)
+        self.last_adapter_event = event
+        self.log_with_clock(logging.INFO, f"[adapter] {json.dumps(event, ensure_ascii=False)}")
+
+        raw_output_path = (self.config.analytics_output_path or "").strip()
+        if raw_output_path == "":
+            self.log_with_clock(logging.WARNING, "⚠️ analytics_output_path 为空，跳过 adapter 文件输出")
+            return
+
+        output_path = raw_output_path
+        if not os.path.isabs(output_path):
+            output_path = os.path.join(os.getcwd(), output_path)
+
+        # 边界修复：当配置为纯文件名（无目录）时，不应对空 dirname 调用 makedirs。
+        raw_dirname = os.path.dirname(raw_output_path)
+        if raw_dirname:
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        try:
+            with open(output_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except Exception as e:
+            self.log_with_clock(logging.WARNING, f"⚠️ adapter 输出失败: {e}")
     
     def _log_position_status(self, current_price: Decimal, status: str):
         """记录仓位状态"""

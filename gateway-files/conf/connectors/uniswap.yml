@@ -1,4 +1,7 @@
 # Global settings for Uniswap
+# Default network for Uniswap (base mainnet)
+defaultNetwork: base
+
 # Default slippage percentage for swaps (2%)
 slippagePct: 2
 

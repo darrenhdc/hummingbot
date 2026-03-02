@@ -6,7 +6,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Dict, Optional
 
-from pydantic import Field
+from pydantic import Field, field_validator, model_validator
 
 from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.connector.connector_base import ConnectorBase
@@ -54,11 +54,11 @@ class UniV3FullCycleConfig(BaseClientModel):
         json_schema_extra={"prompt": "Entry: use % of base token balance", "prompt_on_new": True},
     )
     entry_quote_pct: Decimal = Field(
-        Decimal("100"),
+        Decimal("50"),
         json_schema_extra={"prompt": "Entry: use % of quote token balance", "prompt_on_new": True},
     )
     breakeven_base_pct: Decimal = Field(
-        Decimal("100"),
+        Decimal("50"),
         json_schema_extra={"prompt": "Breakeven: use % of base token balance", "prompt_on_new": True},
     )
     breakeven_quote_pct: Decimal = Field(
@@ -77,10 +77,62 @@ class UniV3FullCycleConfig(BaseClientModel):
         10,
         json_schema_extra={"prompt": "Check interval (seconds)", "prompt_on_new": False},
     )
+    max_position_pct: Decimal = Field(
+        Decimal("50"),
+        json_schema_extra={"prompt": "Max position percent cap (<=50)", "prompt_on_new": True},
+    )
+    gas_token: str = Field(
+        "ETH",
+        json_schema_extra={"prompt": "Gas token symbol", "prompt_on_new": True},
+    )
+    min_gas_reserve: Decimal = Field(
+        Decimal("0.02"),
+        json_schema_extra={"prompt": "Minimum gas token reserve", "prompt_on_new": True},
+    )
+    phase_stuck_timeout_sec: int = Field(
+        900,
+        json_schema_extra={"prompt": "Phase stuck timeout in seconds", "prompt_on_new": False},
+    )
+    order_max_pending_seconds: int = Field(
+        180,
+        json_schema_extra={"prompt": "Max seconds for open/close order pending", "prompt_on_new": False},
+    )
     adopt_existing_position: bool = Field(
         False,
         json_schema_extra={"prompt": "Adopt existing CLMM position if found?", "prompt_on_new": True},
     )
+
+    @field_validator("max_position_pct")
+    @classmethod
+    def validate_max_position_pct(cls, v: Decimal):
+        if v <= 0 or v > 50:
+            raise ValueError("max_position_pct must be in (0, 50]")
+        return v
+
+    @field_validator("min_gas_reserve")
+    @classmethod
+    def validate_min_gas_reserve(cls, v: Decimal):
+        if v <= 0:
+            raise ValueError("min_gas_reserve must be > 0")
+        return v
+
+    @field_validator("entry_lower_buffer_bps")
+    @classmethod
+    def validate_stop_loss_buffer_bps(cls, v: int):
+        if v <= 0:
+            raise ValueError("entry_lower_buffer_bps must be > 0")
+        return v
+
+    @model_validator(mode="after")
+    def validate_position_pct_fields(self):
+        pct_fields = ["entry_base_pct", "entry_quote_pct", "breakeven_base_pct", "breakeven_quote_pct"]
+        for field_name in pct_fields:
+            value = getattr(self, field_name)
+            if value < 0:
+                raise ValueError(f"{field_name} must be >= 0")
+            if value > self.max_position_pct:
+                raise ValueError(f"{field_name} must be <= max_position_pct ({self.max_position_pct})")
+        return self
 
 
 @dataclass
@@ -101,6 +153,8 @@ class UniV3FullCycle(ScriptStrategyBase):
       - await_breakeven_open: after lower breach, compute breakeven and open new range
       - breakeven: close once price recovers to breakeven
     """
+
+    VALID_PHASES = {"idle", "entry", "await_breakeven_open", "breakeven"}
 
     @classmethod
     def init_markets(cls, config: UniV3FullCycleConfig):
@@ -124,6 +178,9 @@ class UniV3FullCycle(ScriptStrategyBase):
         self.close_order_id: Optional[str] = None
         self.pending_close_reason: Optional[str] = None
         self.pending_phase_after_close: Optional[str] = None
+        self.phase_entered_at: datetime = datetime.now()
+        self.open_order_created_at: Optional[datetime] = None
+        self.close_order_created_at: Optional[datetime] = None
 
         self.last_check_time: Optional[datetime] = None
         self.last_price: Optional[Decimal] = None
@@ -144,6 +201,13 @@ class UniV3FullCycle(ScriptStrategyBase):
     def on_tick(self):
         if self.connector_type != ConnectorType.CLMM:
             return
+
+        # Lightweight consistency path: even when orders are pending, still run state recovery checks.
+        if not self._ensure_known_phase():
+            return
+        if not self._ensure_state_consistency():
+            return
+
         if self.position_opening or self.position_closing:
             return
         if self._tick_task is not None and not self._tick_task.done():
@@ -165,6 +229,16 @@ class UniV3FullCycle(ScriptStrategyBase):
     async def _tick_async(self):
         await self._fetch_pool_info()
         if not self.pool_info:
+            return
+
+        if self._pool_liquidity_is_zero():
+            self.logger().warning("Pool liquidity is 0, skip this tick.")
+            return
+
+        if not self._ensure_known_phase():
+            return
+
+        if not self._ensure_state_consistency():
             return
 
         price = Decimal(str(self.pool_info.price))
@@ -202,7 +276,7 @@ class UniV3FullCycle(ScriptStrategyBase):
             if positions:
                 self.position_info = positions[-1]
                 self.position_opened = True
-                self.state.phase = "entry"
+                self._set_phase("entry")
                 self.state.entry_lower_price = Decimal(str(self.position_info.lower_price))
                 self.state.entry_upper_price = Decimal(str(self.position_info.upper_price))
                 self.logger().info(f"Adopted existing CLMM position: {self.position_info.address}")
@@ -231,15 +305,16 @@ class UniV3FullCycle(ScriptStrategyBase):
             entry_lower = self.state.entry_lower_price
             breakeven_price = self.state.breakeven_price
             if entry_lower is None or breakeven_price is None:
-                self.logger().warning("Missing breakeven params; resetting to idle.")
-                self.state = StrategyState()
+                self._set_idle("Missing breakeven params")
                 return
             if price > entry_lower:
                 self.logger().info("Price recovered above entry lower; reset to idle.")
-                self.state = StrategyState()
+                self._set_idle("Breakeven abandoned after recovery")
                 return
             await self._open_breakeven(entry_lower, breakeven_price)
             return
+
+        self._set_idle(f"Unknown no-position phase={phase}")
 
     async def _handle_position(self, price: Decimal):
         phase = self.state.phase
@@ -263,15 +338,19 @@ class UniV3FullCycle(ScriptStrategyBase):
         if phase == "breakeven":
             breakeven_price = self.state.breakeven_price
             if breakeven_price is None:
-                self.logger().warning("Missing breakeven price; resetting to idle.")
-                self.state = StrategyState()
+                self._set_idle("Missing breakeven price")
                 return
             if price >= breakeven_price:
                 await self._close_position(reason="breakeven", next_phase="idle")
             return
 
+        self._set_idle(f"Unknown in-position phase={phase}")
+
     async def _open_entry(self, price: Decimal):
         if self.position_opening or self.position_opened:
+            return
+        if not self._has_sufficient_gas_reserve():
+            self.logger().warning("Insufficient gas reserve for entry open.")
             return
         lower_price, upper_price = self._build_entry_bounds(price)
         base_amount, quote_amount = self._wallet_amounts(
@@ -291,7 +370,8 @@ class UniV3FullCycle(ScriptStrategyBase):
             slippage_pct=float(self.config.slippage_pct) if self.config.slippage_pct is not None else None,
         )
         self.open_order_id = order_id
-        self.state.phase = "entry"
+        self.open_order_created_at = datetime.now()
+        self._set_phase("entry")
         self.state.entry_lower_price = lower_price
         self.state.entry_upper_price = upper_price
         self.logger().info(
@@ -300,6 +380,9 @@ class UniV3FullCycle(ScriptStrategyBase):
 
     async def _open_breakeven(self, entry_lower: Decimal, breakeven_price: Decimal):
         if self.position_opening or self.position_opened:
+            return
+        if not self._has_sufficient_gas_reserve():
+            self.logger().warning("Insufficient gas reserve for breakeven open.")
             return
         base_amount, quote_amount = self._wallet_amounts(
             self.config.breakeven_base_pct, self.config.breakeven_quote_pct
@@ -318,7 +401,8 @@ class UniV3FullCycle(ScriptStrategyBase):
             slippage_pct=float(self.config.slippage_pct) if self.config.slippage_pct is not None else None,
         )
         self.open_order_id = order_id
-        self.state.phase = "breakeven"
+        self.open_order_created_at = datetime.now()
+        self._set_phase("breakeven")
         self.state.breakeven_price = breakeven_price
         self.logger().info(
             f"Opening breakeven position: [{entry_lower:.6f}, {breakeven_price:.6f}] (order {order_id})"
@@ -335,6 +419,7 @@ class UniV3FullCycle(ScriptStrategyBase):
             position_address=self.position_info.address,
         )
         self.close_order_id = order_id
+        self.close_order_created_at = datetime.now()
         self.pending_close_reason = reason
         self.pending_phase_after_close = next_phase
         self.logger().info(f"Closing position ({reason}) order {order_id}")
@@ -344,6 +429,8 @@ class UniV3FullCycle(ScriptStrategyBase):
             self.logger().info(f"Open order {event.order_id} filled.")
             self.position_opened = True
             self.position_opening = False
+            self.open_order_id = None
+            self.open_order_created_at = None
             safe_ensure_future(self._fetch_position_after_open())
             return
 
@@ -351,11 +438,13 @@ class UniV3FullCycle(ScriptStrategyBase):
             self.logger().info(f"Close order {event.order_id} filled.")
             self.position_opened = False
             self.position_closing = False
+            self.close_order_id = None
+            self.close_order_created_at = None
             self.position_info = None
             if self.pending_close_reason == "lower":
                 self._compute_breakeven_after_close()
             else:
-                self.state = StrategyState(phase=self.pending_phase_after_close or "idle")
+                self._set_phase(self.pending_phase_after_close or "idle")
             self.pending_close_reason = None
             self.pending_phase_after_close = None
             return
@@ -377,14 +466,12 @@ class UniV3FullCycle(ScriptStrategyBase):
     def _compute_breakeven_after_close(self):
         entry_lower = self.state.entry_lower_price
         if entry_lower is None:
-            self.logger().warning("Missing entry lower; resetting to idle.")
-            self.state = StrategyState()
+            self._set_idle("Missing entry lower after close")
             return
 
         base_balance = self._get_balance(self.base_token)
         if base_balance <= 0:
-            self.logger().warning("No base balance for breakeven; resetting to idle.")
-            self.state = StrategyState()
+            self._set_idle("No base balance for breakeven")
             return
 
         target = Decimal(self.config.breakeven_target_quote)
@@ -394,11 +481,89 @@ class UniV3FullCycle(ScriptStrategyBase):
         if breakeven_price <= entry_lower:
             breakeven_price = min_price
 
-        self.state.phase = "await_breakeven_open"
+        self._set_phase("await_breakeven_open")
         self.state.breakeven_price = breakeven_price
         self.logger().info(
             f"Computed breakeven price {breakeven_price:.6f} using base balance {base_balance:.6f}"
         )
+
+    def _set_phase(self, phase: str):
+        self.state.phase = phase
+        self.phase_entered_at = datetime.now()
+
+    def _set_idle(self, reason: str):
+        self.logger().warning(f"Reset to idle: {reason}")
+        self.state = StrategyState(phase="idle")
+        self.phase_entered_at = datetime.now()
+        self.pending_close_reason = None
+        self.pending_phase_after_close = None
+
+    def _ensure_known_phase(self) -> bool:
+        if self.state.phase in self.VALID_PHASES:
+            return True
+        self._set_idle(f"Unknown phase={self.state.phase}")
+        return False
+
+    def _pool_liquidity_is_zero(self) -> bool:
+        if self.pool_info is None:
+            return False
+        try:
+            base_amount = Decimal(str(getattr(self.pool_info, "base_token_amount", 0)))
+            quote_amount = Decimal(str(getattr(self.pool_info, "quote_token_amount", 0)))
+        except Exception:
+            return False
+        return base_amount <= 0 and quote_amount <= 0
+
+    def _has_sufficient_gas_reserve(self) -> bool:
+        try:
+            gas_balance = self._get_balance(self.config.gas_token)
+        except Exception as e:
+            self.logger().warning(f"Unable to read gas balance for {self.config.gas_token}: {e}")
+            return False
+        if gas_balance < self.config.min_gas_reserve:
+            self.logger().warning(
+                f"Gas reserve too low: {gas_balance} {self.config.gas_token} < {self.config.min_gas_reserve}"
+            )
+            return False
+        return True
+
+    def _ensure_state_consistency(self) -> bool:
+        now = datetime.now()
+
+        if self.position_opening and self.open_order_id is None:
+            self.position_opening = False
+
+        if self.position_closing and self.close_order_id is None:
+            self.position_closing = False
+
+        if self.position_opening and self.open_order_created_at is not None:
+            pending = (now - self.open_order_created_at).total_seconds()
+            if pending > self.config.order_max_pending_seconds:
+                self.position_opening = False
+                self.open_order_id = None
+                self.open_order_created_at = None
+                self._set_idle("Open order pending timeout")
+                return False
+
+        if self.position_closing and self.close_order_created_at is not None:
+            pending = (now - self.close_order_created_at).total_seconds()
+            if pending > self.config.order_max_pending_seconds:
+                self.position_closing = False
+                self.close_order_id = None
+                self.close_order_created_at = None
+
+        if self.state.phase in {"entry", "breakeven"} and not self.position_opened and not self.position_opening:
+            elapsed = (now - self.phase_entered_at).total_seconds()
+            if elapsed > self.config.phase_stuck_timeout_sec:
+                self._set_idle(f"Phase {self.state.phase} timeout without active position")
+                return False
+
+        if self.position_opened and self.position_info is None and not self.position_opening:
+            self.position_opened = False
+            self._set_idle("Position flag set but position info missing")
+            return False
+
+        return True
 
     def _wallet_amounts(self, base_pct: Decimal, quote_pct: Decimal) -> tuple[Decimal, Decimal]:
         base_balance = self._get_balance(self.base_token)
